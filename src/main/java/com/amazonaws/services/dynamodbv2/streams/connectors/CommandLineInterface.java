@@ -16,6 +16,10 @@ package com.amazonaws.services.dynamodbv2.streams.connectors;
 import java.util.Properties;
 import java.util.UUID;
 
+import com.amazonaws.client.builder.AwsClientBuilder;
+import com.amazonaws.services.cloudwatch.AmazonCloudWatchClientBuilder;
+import com.amazonaws.services.dynamodbv2.*;
+import com.google.common.base.Preconditions;
 import org.apache.log4j.Logger;
 
 import com.amazonaws.ClientConfiguration;
@@ -24,10 +28,6 @@ import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.regions.Region;
 import com.amazonaws.services.cloudwatch.AmazonCloudWatch;
 import com.amazonaws.services.cloudwatch.AmazonCloudWatchClient;
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClient;
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDBStreams;
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDBStreamsClient;
 import com.amazonaws.services.dynamodbv2.model.Record;
 import com.amazonaws.services.dynamodbv2.streamsadapter.AmazonDynamoDBStreamsAdapterClient;
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.InitialPositionInStream;
@@ -60,6 +60,7 @@ public class CommandLineInterface {
 
         // Source and destination regions
         Region sourceRegion;
+        Region kclRegion;
         Region destinationRegion;
 
         // Pipeline
@@ -86,7 +87,7 @@ public class CommandLineInterface {
             }
 
             // get current region, if no result set to default us-east-1 region
-            Region curRegion = DynamoDBConnectorUtilities.getCurRegion();
+            kclRegion = DynamoDBConnectorUtilities.getRegionFromEndpoint(params.getKclEndpoint());
 
             // extract streams endpoint, source and destination regions
             streamsEndpoint = DynamoDBConnectorUtilities.getStreamsEndpoint(params.getSourceEndpoint());
@@ -99,24 +100,31 @@ public class CommandLineInterface {
             AWSCredentialsProvider credentialsProvider = new DefaultAWSCredentialsProviderChain();
 
             // initialize DynamoDB client and set the endpoint properly
-            AmazonDynamoDBClient dynamodbClient = new AmazonDynamoDBClient(credentialsProvider);
-            dynamodbClient.setEndpoint(params.getSourceEndpoint());
+            AmazonDynamoDB dynamodbClient = AmazonDynamoDBClientBuilder.standard()
+                    .withCredentials(credentialsProvider)
+                    .withEndpointConfiguration(new AwsClientBuilder.EndpointConfiguration(params.getSourceEndpoint(),
+                            sourceRegion.getName() /*signingRegion*/))
+                    .build();
             
             // initialize Streams client
-            AmazonDynamoDBStreams streamsClient = new AmazonDynamoDBStreamsClient(credentialsProvider);
-            streamsClient.setEndpoint(streamsEndpoint);
+            AmazonDynamoDBStreams streamsClient = AmazonDynamoDBStreamsClientBuilder.standard()
+                    .withCredentials(credentialsProvider)
+                    .withEndpointConfiguration(new AwsClientBuilder.EndpointConfiguration(streamsEndpoint,
+                            sourceRegion.getName() /*signingRegion*/))
+                    .build();
 
             // obtain the Stream ID associated with the source table
             String streamArn = dynamodbClient.describeTable(params.getSourceTable()).getTable().getLatestStreamArn();
-            if (streamArn == null) {
-                throw new IllegalArgumentException(DynamoDBConnectorConstants.MSG_NO_STREAMS_FOUND);
-            } else if (!DynamoDBConnectorUtilities.isStreamsEnabled(streamsClient, streamArn, DynamoDBConnectorConstants.NEW_AND_OLD)) {
-                throw new IllegalArgumentException(DynamoDBConnectorConstants.STREAM_NOT_READY);
-            }
+            Preconditions.checkArgument(streamArn != null, DynamoDBConnectorConstants.MSG_NO_STREAMS_FOUND);
+            Preconditions.checkArgument(DynamoDBConnectorUtilities.isStreamsEnabled(streamsClient, streamArn, DynamoDBConnectorConstants.NEW_AND_OLD),
+                    DynamoDBConnectorConstants.STREAM_NOT_READY);
 
             // initialize DynamoDB client for KCL. Use the local region for lowest latency access
-            AmazonDynamoDB kclDynamoDBClient = new AmazonDynamoDBClient(credentialsProvider);
-            kclDynamoDBClient.setRegion(curRegion);
+            AmazonDynamoDB kclDynamoDBClient = AmazonDynamoDBClientBuilder.standard()
+                    .withCredentials(credentialsProvider)
+                    .withEndpointConfiguration(
+                            new AwsClientBuilder.EndpointConfiguration(params.getKclEndpoint(), kclRegion.getName()))
+                    .build();
 
             // initialize DynamoDB Streams Adapter client and set the Streams endpoint properly
             ClientConfiguration streamsClientConfig = new ClientConfiguration().withGzip(false);
@@ -125,8 +133,9 @@ public class CommandLineInterface {
             streamsAdapterClient.setEndpoint(streamsEndpoint);
 
             // initialize CloudWatch client and set the region to emit metrics to
-            AmazonCloudWatch kclCloudWatchClient = new AmazonCloudWatchClient(credentialsProvider);
-            kclCloudWatchClient.setRegion(curRegion);
+            AmazonCloudWatch kclCloudWatchClient = AmazonCloudWatchClientBuilder.standard()
+                    .withCredentials(credentialsProvider)
+                    .withRegion(kclRegion.getName()).build();
 
             // try to get taskname from command line arguments, auto generate one if needed
             taskName = DynamoDBConnectorUtilities.getTaskName(sourceRegion, destinationRegion, params);
