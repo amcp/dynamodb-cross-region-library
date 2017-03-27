@@ -25,6 +25,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import com.amazonaws.services.cloudwatch.model.PutMetricDataResult;
+import lombok.extern.log4j.Log4j;
 import org.apache.log4j.Logger;
 
 import com.amazonaws.AmazonClientException;
@@ -62,6 +64,7 @@ import com.amazonaws.services.kinesis.connectors.interfaces.IEmitter;
  * A general emitter for replication DynamoDB writes from a DynamoDB Stream to another DynamoDB table. Assumes the IBuffer implementation deduplicates writes to a single write per
  * item key. Asynchronously makes the writes to the DynamoDB table.
  */
+@Log4j
 public class DynamoDBReplicationEmitter implements IEmitter<Record> {
 
     /**
@@ -79,12 +82,6 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
 
     private static final int WAIT_TIME_MS = 100;
 
-    // private static final int THREADPOOL_SIZE = 1000;
-
-    /**
-     * Logger for the {@link DynamoDBReplicationEmitter} class.
-     */
-    private static final Logger LOGGER = Logger.getLogger(DynamoDBReplicationEmitter.class);
     /**
      * DynamoDB Replication Emitter User Agent
      */
@@ -228,7 +225,7 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
             request = deleteItemRequest;
         } else {
             // This should only happen if DynamoDB Streams adds/changes its operation types
-            LOGGER.warn("Unsupported operation type detected: " + eventName + ". Record: " + record);
+            log.warn("Unsupported operation type detected: " + eventName + ". Record: " + record);
             request = null;
         }
         if (null != request) {
@@ -245,7 +242,7 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
         if (isShutdown) {
             if (buffer.getRecords().isEmpty()) {
                 // This is OK, but not expected
-                LOGGER.warn("Record processor called emit after calling shutdown. Continuing becuase buffer is empty.");
+                log.warn("Record processor called emit after calling shutdown. Continuing becuase buffer is empty.");
                 return Collections.emptyList();
             } else {
                 throw new IllegalStateException("Cannot emit records after emitter has been shutdown.");
@@ -291,7 +288,7 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
                         (AsyncHandler<UpdateItemRequest, UpdateItemResult>) getHandler(toSubmit, failedRecords, retryCount, doneSignal, record));
                 } else { // Should only happen if DynamoDB allows a new operation other than {PutItem, DeleteItem,
                          // UpdateItem} for single item writes.
-                    LOGGER.warn("Unsupported DynamoDB request: " + request);
+                    log.warn("Unsupported DynamoDB request: " + request);
                 }
             }
         } finally {
@@ -301,10 +298,10 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
         }
         emitCloudWatchMetrics(records, failedRecords, retryCount);
         if (!records.isEmpty()) {
-            LOGGER.debug("Successfully emitted " + (records.size() - failedRecords.size()) + " records ending with sequence number "
+            log.debug("Successfully emitted " + (records.size() - failedRecords.size()) + " records ending with sequence number "
                 + buffer.getLastSequenceNumber());
         } else {
-            LOGGER.debug("No records to emit");
+            log.debug("No records to emit");
         }
         return failedRecords;
     }
@@ -322,7 +319,7 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
                     }
                 } else if (exception instanceof ItemCollectionSizeLimitExceededException) {
                     // Not Retryable, but from DynamoDB
-                    LOGGER.error("Local Secondary Index is full: " + record, exception);
+                    log.error("Local Secondary Index is full: " + record, exception);
                     if (skipErrors) {
                         failedRecords.add(record);
                         doneSignal.countDown();
@@ -330,7 +327,7 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
                         System.exit(StatusCodes.EIO);
                     }
                 } else if (exception instanceof AmazonServiceException && 413 == ((AmazonServiceException) exception).getStatusCode()) {
-                    LOGGER.error("Request entity too large: " + record, exception);
+                    log.error("Request entity too large: " + record, exception);
                     if (skipErrors) {
                         failedRecords.add(record);
                         doneSignal.countDown();
@@ -347,11 +344,11 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
                     // AmazonServiceException - any unhandled response from the DynamoDB service
                     // AmazonClientException - any other 400 response: validation, authentication, authorization, or configuration exception
                     //
-                    LOGGER.fatal("Exception emitting record: " + record, exception);
+                    log.fatal("Exception emitting record: " + record, exception);
                     System.exit(StatusCodes.EIO);
                 } else {
                     // This block catches all other exceptions. Since it was not expected, this is an unrecoverable exception.
-                    LOGGER.fatal("Abnormal exception emitting record: " + record, exception);
+                    log.fatal("Abnormal exception emitting record: " + record, exception);
                     System.exit(StatusCodes.EIO);
                 }
             }
@@ -368,7 +365,7 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
 
             @Override
             public void onSuccess(AmazonWebServiceRequest request, Object result) {
-                LOGGER.trace("Record emitted successfully: " + record.getDynamodb().getSequenceNumber());
+                log.trace("Record emitted successfully: " + record.getDynamodb().getSequenceNumber());
                 doneSignal.countDown();
             }
         };
@@ -389,7 +386,7 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
         }
         if (isShutdown) {
             if (records.isEmpty() && failures.isEmpty()) {
-                LOGGER.warn("emitCloudWatchMetrics called after shutdown. Continuing because records and failures lists are empty");
+                log.warn("emitCloudWatchMetrics called after shutdown. Continuing because records and failures lists are empty");
                 return;
             } else {
                 throw new IllegalStateException("emitCloudWatchMetrics called after shutdown");
@@ -408,15 +405,15 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
             return;
         }
         final PutMetricDataRequest request = new PutMetricDataRequest().withNamespace(applicationName).withMetricData(metrics);
-        cloudwatch.putMetricDataAsync(request, new AsyncHandler<PutMetricDataRequest, Void>() {
+        cloudwatch.putMetricDataAsync(request, new AsyncHandler<PutMetricDataRequest, PutMetricDataResult>() {
             @Override
-            public void onSuccess(PutMetricDataRequest request, Void result) {
-                LOGGER.trace("Published metric: " + request);
+            public void onSuccess(PutMetricDataRequest request, PutMetricDataResult result) {
+                log.trace("Published metric: " + request);
             }
 
             @Override
             public void onError(Exception exception) {
-                LOGGER.error("Could not publish metric: " + request, exception);
+                log.error("Could not publish metric: " + request, exception);
             }
         });
     }
@@ -429,14 +426,14 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
         if (isShutdown) {
             if (records.isEmpty()) {
                 // This is OK (but not expected)
-                LOGGER.warn("Emitter fail method called after shutdown method was called. Continuing because list is empty");
+                log.warn("Emitter fail method called after shutdown method was called. Continuing because list is empty");
                 return;
             } else {
                 throw new IllegalStateException("Emitter fail method called after shutdown method was called.");
             }
         }
         for (Record record : records) {
-            LOGGER.error("Could not emit record: " + record);
+            log.error("Could not emit record: " + record);
         }
         final AmazonCloudWatchAsync cloudwatch = CLOUDWATCH.get();
         if (null != cloudwatch) {
@@ -454,7 +451,7 @@ public class DynamoDBReplicationEmitter implements IEmitter<Record> {
     @Override
     public void shutdown() {
         if (isShutdown) {
-            LOGGER.warn("shutdown called multiple times");
+            log.warn("shutdown called multiple times");
             return;
         }
         isShutdown = true;
